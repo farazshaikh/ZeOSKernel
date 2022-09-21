@@ -1,0 +1,12 @@
+*
+!*.*
+!*/
+
+*.dep
+*.o
+*.a
+temp/*
+*~
+kernel
+bootfd.img
+kernel.strip

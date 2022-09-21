@@ -1,0 +1,232 @@
+#+TITLE:  ZeOS - A Preemptive Multi-threaded Kernel.
+#+AUTHOR: Faraz Shaikh (fshaikh@cs.cmu.edu)
+#+AUTHOR: Deepak Amin (dvamin@cs.cmu.edu)
+#+NOTE:   2008-2009 15-410 Carnegie Mellon University
+#+OPTIONS: toc:2
+
+
+* ZeOS - A Preemptive Multi-threaded Kernel. :TOC:
+  - [[#task-structure-and-kernel-stack-setup][Task Structure and Kernel stack setup]]
+  - [[#virtual-memory-management-vmm][Virtual Memory management VMM]]
+  - [[#kernel-stack-setup][Kernel Stack Setup]]
+  - [[#process-synchronization][Process Synchronization:]]
+  - [[#copy-on-write-cow--zero-fill-on-demand-zfod][Copy On Write (COW) + Zero Fill On-Demand (ZFOD)]]
+  - [[#task-garbage-collection][Task garbage collection.]]
+  - [[#exec--loader][Exec / Loader]]
+  - [[#usage-of-inline-asm][Usage of inline ASM]]
+  - [[#system-call-code-patching][system call code patching]]
+  - [[#system-call-parameter-checking][system call parameter checking]]
+  - [[#scheduler][Scheduler]]
+  - [[#faultexception-handlers][Fault/Exception handlers]]
+  - [[#device-drivers][Device drivers]]
+
+** Task Structure and Kernel stack setup
+
+ZeOS Task is equivalent to a UNIX process with multiple kernel-level threads.
+The in-memory task structure aka. the Task Control Block TCB, underpins most of
+ZeOS design ideas.  Following are the implementation detail for the TCB
+
+a. initial_thread
+
+Every task has one or more threads executing in its body.  Every Task is
+initialized with one thread -> initial_thread, which is added to the task's thread
+queue.  This thread is also the first element inside the TCB struct as is used
+to derive the address of the task.  In ZeOS, there is no explicit threadID
+generation. The pointer to the thread struct serves as the threadID for that thread,
+which also means that these structures are pinned to a memory address. The
+thread struct inside the task has the following detail:
+
+	- context: current and base pointers for the kernel stack.
+	- pTask: pointer to this threads  parent task (useful when setting PDBR)
+        - kthread_next: queue of sibling thread pointers
+        - kthread_wait: queue of threads to be reaped
+        - state: enum representing the state of thread - runnable, waiting
+        - sleepticks: duration of sleep, for a sleeping thread (on a global sleep queue)
+	- run_flag: if run_flag is negative, then the thread is not run able
+
+b. vm
+
+This structure manages the virtual memory for the task.  The vm struct maintains
+the task's memory map aka the virtual addressable space.  ZeOS implements copy on
+write *COW* and zero fill on demand *ZFOD* for memory pages.  The COW feature
+enables the allocation of large virtual mem ranges (4G - 16M - (current stack
+range)). The virtual memory range is only backed by physical pages if the
+process attempts to write to it. VM struct maintains the following:
+
+	- vm_ranges_head - queue of address ranges (start + len) in task vm
+	- initial exec ranges - ranges for .TEXT, .RODATA, .DATA and .STACK
+                                .... (consistent with p3ck1 design)
+	- pde_base - task's i386 page directory base register
+
+NOTE: A artificial allocation limit of 512MB per alloc() system call is set for
+meeting the test requirement.
+
+c. ktask_threads_head - A queue of threads belonging to this task
+
+d. fork_lock - task level semaphore used for task synchronization
+
+e. ktask_task_head, ktask_next - VQ head that maintains a list of forked child tasks
+
+f. parentTask - pointer to the task's parent
+
+g. vultures - semaphore used to synchronize task wait and vanish
+
+h. state - maintains the state of the task (default - running)
+
+i. status - task exit status.
+
+j. allocated_pages_mem - pages allocated for the task (used for allocation
+checks per single process)
+
+Every task is initialized with a kernel stack configuration identical to its
+parent.  (The first task aka "init task" is handcrafted by the VMM initializing
+functions) The task struct itself is then stored in the kernel memory, along
+with the task's Page Directory, 4 kernel Page Tables and the Kernel stack.
+
+** Virtual Memory management VMM
+
+        ZeOS VM management is the heaviest in terms of code density. Most of the
+task handling functions are moved to the VM than the task itself (refactoring &
+re-org will help this code base). VMM code is a factory for new tasks.VMM owns
+the task's vm_range struct that maintains the virtual memory map of the
+user-land memory allocation for each task. VMM tracks the physical page frame
+availability, and the COW+ZFOD implementation on task page frames (setting of
+reference bits on multi-read access).
+
+** Kernel Stack Setup
+
+        A Kernel stack setup maintains 3 constructs
+	a. IRET frame for switching to user-mode
+	b. context switch register PDBR, to switch between processes on
+	pre-emption.
+	c. Unsolicited return call from the fork() system call.
+
+The top of the kernel stack thus maintains the bulk of the above contexts for
+each process while serving a system call in kernel mode.
+
+** Process Synchronization:
+
+        ZeOS core synchronization primitive is a uni-processor spinlock.  Other
+than spinlocks, a semaphore implementation is provided. Semaphores are wait
+queues and integer counters protected by spinlocks.
+
+Semaphores are used in cross-task synchronization, as well as for inter-process
+signaling during child's vanish() and parent's reap/wait() calls.
+
+
+NOTE: ZeOS spinlock implementation is NOT FOR MULTIPROCESSOR (SMP)
+kernels. Instead, a uni-processor spinlock implements synchronization using
+interrupt masking via the 'CLI' and 'STI' instructions.  CLI a uni-processor
+simply disables preemption via the timer interrupt. ZeOS strives for extremely
+short critical sections, to keep the system pre-emptable and responsive at all
+times.
+
+NOTE: Besides __asm__ LCK: XCHG based spin locks a lot more work is needed to
+make this kernel SMP aware.
+
+** Copy On Write (COW) + Zero Fill On-Demand (ZFOD)
+
+ZeOS implements Copy on Write(COW) and Zero Fill on demand on page frames. COW
+helps with faster forks as the child & parent tasks continue to share with the
+parent's pages until there is a divergent write in either address space.
+
+Zero fill on demand allows processes to allocate large amounts of virtual
+memory. The allocation and zeroing of the page frame are deferred to the time of
+actual writing to the virtual address range.
+
+NOTE: The code from the executable is allocated and initialized upfront on the exec
+system call.  That is, the code is faulted in by COW/ZFOD
+
+
+Memory allocation only registers a range in the task struct, and actual memory
+mapping is deferred.  On a page fault, the fault handler verifies that the page
+is part of the registered address space and allocates a physical page frame to
+back the virtual address range.
+
+fork() does not copy the page frame contents from the parent.  Instead the page
+frame's reference count is incremented and the frame is marked read-only in both
+the parent and child address space.  On first write (either from child or
+parent), the fault handler copies and make a private version of the pages
+available to the task.
+
+** Task garbage collection.
+
+Upon task exit()/abort() the task and its address space have to be garbage
+collected (GC) and freed.  This GC action can be performed by the parent on the
+wait() system call or by the child task in the exit() system call.
+
+In ZeOS this responsibility is shared by the parent and child. The child task on
+exit() cleanups up all *but* the initial_thread. This freeing ensures that a lot
+of zombie processes don't clog up system resources waiting to be reaped by their
+parent. The initial_thread task that lingers around after a task has exit()
+takes minimum memory space to convey the exit status to the parent.
+
+** Exec / Loader
+
+
+ZeOS uses the p3ck1 loader used for implementing the user mode libraries.
+The loader takes a RAM disk file path and loads its contents into the address range
+managed by the vm struct of the task.
+
+** Usage of inline ASM
+TBA
+
+
+** system call code patching
+
+ZeOS systems call dispatch table entry consists of the system call number,
+function address and a pre-flight verification function. System call entry is
+via a soft interrupt. All ISR's point to a template function that jumps to the
+system_call_entry() function. The templates are dynamically patched to push a
+single parameter denoting the system call number before calling the
+system_call_entry() function.
+
+This patching eliminates duplication of boilerplate code needed for each system
+call viz. parameter checking and dispatch. In higher-level languages this can be
+done using macros or templates, ZeOS chooses to hand generate this patching
+functionality using dynamic code generation aka. code patching.
+
+** system call parameter checking
+
+Every system call has a pre-flight check function that sanitizes user mode
+addresses passed to the system call.
+
+** Scheduler
+
+        ZeOS implements a round-robin scheduler that takes O(1) decision to
+schedule the next runnable thread.  The scheduler is invoked periodically via
+the timer interrupt, the scheduler code itself disables pre-emption to avoid
+re-entrancy issues.
+
+A simple task selection policy schedules the first thread in the run queue while
+pushing the current thread to the back of the queue if requested. A task can request
+itself to be scheduled last if it's waiting for a synchronization event to be
+triggered by some other thread. This avoids spurious wake-ups to a certain
+extent.
+
+** Fault/Exception handlers
+
+        ZeOS installs a catch-all fault handler. The fault handler adheres to
+the specification defined in kernel_spec.pdf. Also, Inter-sys documentation
+expects a default behavior expected for all fault handlers. The fault handler
+implementation is similar to syscalls, except that it does not involve any code
+patching or extraction of the parameter packet (%esi).
+
+** Device drivers
+
+Boot drivers are similar to their p1 implementation.
+
+- Console driver - provides page_scroll and backspace handling functionalities
+
+- Keyboard driver - maintains buffers for scan codes and processed chars.  The
+  interrupt loads the raw buffer. Then it is de-queued, processed, printed on
+  the console and loaded onto the processed char buffer in the bottom half
+  handler (backspace is handled here).  Synchronous calls like readline() and
+  readchar() are implemented by reading the processed buffer.
+
+- Timer Driver - The timer driver has two tasks. First, it calls schedule()
+  which switches context if another run-able thread is available. Second, the
+  scheduler decrements sleep ticks for threads that are sleeping. When ticks
+  underflow the sleeping tasks are woken up.
+
+More documentation about the kernel can be found in-line.

@@ -1,0 +1,182 @@
+/**********************************
+
+@mainpage 15-410 Project 3
+
+@author Faraz Shaikh (fshaikh)
+@author Deepak Amin (dvamin)
+
+**********************************
+
+
+    Project 3 - Zeos (Kernel)
+    ==============================
+
+Introduction to reader:
+
+Task Structure / Kern stack setup
+=================================
+        The structure of a task in memory (Task Control Block) defines most of our design ideas.
+Following is the implementation detail on our task struct:
+i.  initial_thread - Every Task comprises of one or more threads executing in its body.
+Every Task is initialized with one thread -> initial_thread, which is added to task's thread queue.
+The thread must also be the first element as it must share the pointer address with the task.
+And in our design, there is no explicit threadID generation. The pointer to thread struct serves
+as the threadID for that thread. The thread struct inside the task has the following detail:
+	- context : struct that maintains kernel stack current pointer and kernel stack base pointers
+	- pTask   : pointer to the task to which this thread belongs (useful when setting pdbr)
+        - kthread_next : a variable queue implementation; queue of sibling thread pointers
+        - kthread_wait : a variable queue implementation; queue of threads to be reaped
+        - state   : enum for representing state of thread - runnable , waiting
+        - sleepticks   : duration of sleep, if the thread is sleeping (in a global sleep queue)
+	- run_flag     : if run_flag is negative, then thread is not runnable
+ii.  vm - This is the most important struct within the task, as it manages the Virtual Memory for it.
+The vm maintains the tasks memory map of the tasks virtual addressable space.
+This is useful in our *COW* + *ZFOD* implementation, where we aloocate/deallocate memory at runtime.
+The COW setup lets us allocate large mem ranges (4G - 16M - (current stack range)), 
+and allows processes that ask for hugemem and yet use only a small portion of it.
+However, for meeting the test requirement, we set a allocation limmit of 512MB per alloc.
+Following are some of the details maintained inside the VM:
+	- vm_ranges_head - a VQ implementation; queue of ranges (start + len) in task vm
+	- initial exec ranges - start and len values of text, rodata, data and stack
+                                .... (consistent with p3ck1 design)
+	- pde_base - task's pdbr value
+iii. ktask_threads_head - VQ implementation; Maintains a queue of threads belonging to this task
+iv.  fork_lock - task level semaphore used for task synchronization
+v.   ktask_task_head , ktask_next - VQ head that maintains a list of forked child tasks
+vi.  parentTask - pointer to the task's parent
+vii. vultures - semaphore used to synchronize task wait and vanish
+viii.state - maintains the state of the task (default - running)
+ix.  status - sets the status here before exiting.
+x.   allocated_pages_mem - pages allocated for the task (used for allocation checks per single process)
+
+Every task is initialized to a kernel configuration identical to its parent.
+(The first task is handcrafted by the vmm initializing functions)
+The task struct itself is then stored in the kernel memory, along with the task's
+Page Directory, 4 kernel Page Tables and the Kernel stack.
+
+VM management
+=============
+        Our VM management is the heaviest in terms of code density, as most of the task handling functions
+are moved to the VM than the task itself. VM maintains the physical frame availability,
+and also shapes the COW+ZFOD implementation (setting of reference bits on multi read access)
+VM is responsible for creating and freeing each task (both its user and kernel allocations)
+Another important feature of VM is the vm_range struct that maintains the virtual memory map
+of the userland memory allocation for that process.
+
+Kernel Stack Setup
+==================
+        Kernel stack setup required us to satisfy 3 requirements - maintain the IRET frame to switch to
+usermode, maintain the context switch register context to switch between processes
+and third to return from syscall (say, eg during child-birth after fork())
+The top of kernel stack would therefore maintain the entire bulk of the above contexts 
+for each process in a system call / kernel mode.
+
+Achieving Process Synchronization:
+==================================
+        In our kernel, we have used spinlocks as the primary process synchronization primitives.
+We also use semaphores where the integers are protected using spinlocks within.
+The semaphores are used in synchronization between tasks, one for protecting the critical sections,
+but also for interprocess signalling during child's vanish and parent's reap/wait calls.
+Our spinlocks are not implemented as they would be on an SMP kernel. Instead we have tweaked to
+satisfy the spinlock requirements on a uniprocessor, by using 'cli' and 'sti' instructions.
+While pre-emption is disabled during these locks, it is assured that the task between 
+such lock-unlocks are minimal and will not affect the pre-emptibility of the kernel.
+
+Copy On Write + Zero Fill On-Demand
+===================================
+        In our kernel, we have setup COW+ZFOD so that we amortize the cost of memory allocation,
+instead of loading calls like fork and new_pages. On creating and running a new task, 
+after its fork and exec, the initial sections of the ELF file are however loaded on load,
+and not at runtime. While COW+ZFOD allows us to satisfy adversary processes 
+that request bulk of memory and not use it (All addresses except KERNEL space and downward stack).
+Such processes will be allowed to grow page by page until it clashes with the top of stack, 
+when the task is killed and cleaned up. On allocation we only allocate a range in the task struct,
+and we refrain from mapping this in memory. On a fault (on user access to any offset inside this page)
+the page fault handler verifies if the page is indeed a part of the address space
+and then allocates a new physical frame to the task and maps this page virtually using PDE and PTEs.
+During fork we do not copy over the frame contents, but increment a reference count holder
+for that frame by one, and set the virtual addresses accessing that frame to be read-only.
+On writing, the faulthandler makes an on the fly copy of the page for the writing process
+onto a different physical frame (COW).
+
+Wait-Vanish load balancing
+==========================
+        One of the challenges we faced was to divide the task of reaping/cleaning up the task memory
+was to clean up all memory on the death of a task. This task could be done by parent (in its wait)
+or by self in vanish. But since the exit state had to be proagated to the parent task,
+our task will just clean up forked threads during calls to vanish, where as the task, initial_thread
+is freed during the parents reaping action in wait.
+
+Exec / Loader
+=============
+        Our loader is consistent with the loader that we maintained during p3ck1,
+it takes a file name and a task and loads the file in RAMdisk onto the vm struct of the task.
+The loader could do without a certain implementation, but we decided to maintain that detail,
+as 
+
+Usage of inline ASM
+===================
+
+Zombie processes
+================
+        Currently, the kernel is implemented to closely knit the tasks and the threads together
+using the VQ implementation across the threads, the tasks and threads within tasks.
+When a thread dies the thread is reaped in vanish if it was forked, but for initial_threads
+we safely deallocate the entire task from the memory. On task deletions, the parent pointers
+are appropriately modified, and threads are continuously jumping queues to reflect their runflag.
+We will not have any zombie processes when there are no threads to schedule. Every dead process
+is reaped by its parent, before the parent exits. Only the forked threads must be cleared separately.
+
+system call code patching
+=========================
+        Our system calls are implemented in the form of a jumptable that implements all calls.
+We only install one isr for the system call, which then references to the jumptable on each call.
+Once the function address is obtained, the function is malloced into the kernel data
+and then the system call template in the .S file is adjusted to reflect the call to this function 
+in the systam call, and the function is created, patched and destroyed at runtime.
+
+system call parameter checking
+==============================
+We have a separate set of functions in a file, whose job is to scan the arguments supplied
+to the system calls and then appropiately verify mem access permissions and at times
+even check value ranges for each systm call.  This function is called before 
+any system call is made.
+
+scheduler
+=========
+	Type - Round robin scheduler.
+        Our scheduler is the bottom most link between all the threads in the concurrent kernel.
+The scheduler disable and enable pre-emption while performing its duties.
+The scheduler schedules the first thread in the queue while pushing the current thread
+into the queue if requested.
+
+faulthandlers
+=============
+        We have installed all Faulthandler in our kernel. The behavior of the handler towards
+the fault is derived out of the kernel_spec.pdf (which system calls need to be handled) 
+and from the Inter-sys documentation - default behaviour expected for all fault handlers.
+Our fault handler implementation is similar to our syscall, except that we're not patching the code
+and nor are we exrtracting the parameter packet (%esi). The jump table provides the index and offsets
+to the various fault handlers, and each handler is installed separately onto the IDT.
+
+boot drivers
+============
+Boot drivers are similar to their p1 implementation.
+Console driver - provides page_scroll and backspace handling functionailities
+Keyboard driver - maintains 2 buffers (one scancodes, other processed chars).
+The interrupt loads the raw buffer. It is dequeued, processed, printed on console and
+loaded onto the processed char buffer in the bottom half handler (backspace is handled here). 
+The synchronous calls like readline and readchar are implemented by reading the processed buffer.
+Timer Driver - Our timer driver has only two tasks.
+One it calls schedule which switches context if other runnable threads are available.
+Other, if threads are sleeping, then it decrements their ticks, and when ticks underflow
+it wakes up those tasks.
+
+More documentation about the kernel can be found in-line.
+Each function and file have specific documentation
+and also some special mentions are made inside when handling some interesting cases.
+
+
+=============================================================================
+
+*/
